@@ -906,10 +906,11 @@ do  --constructor functions for terra functions and variables
     local function layoutstruct(st,tree,env)
         local diag = terra.newdiagnostics()
         diag:begin()
-        if st.tree and st.tree ~= "undefined" then
+        if st.tree then
             diag:reporterror(tree,"attempting to redefine struct")
             diag:reporterror(st.tree,"previous definition was here")
         end
+        st.undefined = nil
 
         local function getstructentry(v)
             local success,resolvedtype = terra.evalluaexpression(diag,env,v.type)
@@ -954,7 +955,7 @@ do  --constructor functions for terra functions and variables
                 return origv
             else
                 local st = terra.types.newstruct(name,3)
-                st.tree = "undefined"
+                st.undefined = true
                 return st
             end 
         end,...)
@@ -1127,7 +1128,7 @@ do --construct type table that holds the singleton value representing each uniqu
                     diag:reporterror(self.anchor,erroronrecursion)
                 else 
                     self[inside] = true
-                    self[key] = getvalue(self,diag,anchor or terralib.newanchor(1))
+                    self[key] = getvalue(self,diag,anchor or terra.newanchor(1))
                     self[inside] = nil
                 end
                 if diag:haserrors() then
@@ -1277,7 +1278,7 @@ do --construct type table that holds the singleton value representing each uniqu
             if type(self.metamethods.__getentries) == "function" then
                 local success,result = terra.invokeuserfunction(self.anchor,false,self.metamethods.__getentries,self)
                 entries = (success and result) or {}
-            elseif self.tree == "undefined" then
+            elseif self.undefined then
                 diag:reporterror(anchor,"attempting to use a type before it is defined")
                 diag:reporterror(self.anchor,"type was declared here.")
             end
@@ -1462,8 +1463,9 @@ do --construct type table that holds the singleton value representing each uniqu
             if not s then
                 name = "u"..name
             end
-            registertype(name,
-                         mktyp { kind = terra.kinds.primitive, bytes = size, type = terra.kinds.integer, signed = s})
+            local typ = mktyp { kind = terra.kinds.primitive, bytes = size, type = terra.kinds.integer, signed = s}
+            registertype(name,typ)
+            typ:cstring() -- force registration of integral types so calls like terralib.typeof(1LL) work
         end
     end  
     
@@ -1872,10 +1874,12 @@ function terra.specialize(origtree, luaenv, depth)
         end
         
         local function mkop(op,a,b)
+           a = (type(a) == "string" and mkvar(a)) or a
+           b = (type(b) == "string" and mkvar(b)) or b
            return terra.newtree(s, {
             kind = terra.kinds.operator;
             operator = terra.kinds[op];
-            operands = terra.newlist { mkvar(a), mkvar(b) };
+            operands = terra.newlist { a, b };
             })
         end
 
@@ -1884,8 +1888,13 @@ function terra.specialize(origtree, luaenv, depth)
             variables = mkdefs("<i>","<limit>","<step>");
             initializers = terra.newlist({s.initial,s.limit,s.step})
         })
-        
+        local zero = terra.createterraexpression(diag,s,0LL)
         local lt = mkop("<","<i>","<limit>")
+        local gt = mkop(">","<i>","<limit>")
+        local slt = mkop("<","<step>",zero)
+        local sgt = mkop(">","<step>",zero)
+        local cond = mkop("or",mkop("and",sgt,lt),
+                               mkop("and",slt,gt))
         
         local newstmts = terra.newlist()
 
@@ -1915,7 +1924,7 @@ function terra.specialize(origtree, luaenv, depth)
         
         local wh = terra.newtree(s, {
             kind = terra.kinds["while"];
-            condition = lt;
+            condition = cond;
             body = nbody;
         })
     
@@ -2457,7 +2466,7 @@ function terra.funcdefinition:typecheck()
     end
 
     local operator_table = {
-        ["-"] = { checkarithpointer, "__sub" };
+        ["-"] = { checkarithpointer, "__sub", "__unm" };
         ["+"] = { checkarithpointer, "__add" };
         ["*"] = { checkarith, "__mul" };
         ["/"] = { checkarith, "__div" };
@@ -2490,7 +2499,8 @@ function terra.funcdefinition:typecheck()
             return ee:copy { type = ty, operands = terra.newlist{e} }
         end
         
-        local op, overloadmethod = unpack(operator_table[op_string] or {})
+        local op, genericoverloadmethod, unaryoverloadmethod = unpack(operator_table[op_string] or {})
+        
         if op == nil then
             diag:reporterror(ee,"operator ",op_string," not defined in terra code.")
             return ee:copy { type = terra.types.error }
@@ -2500,6 +2510,7 @@ function terra.funcdefinition:typecheck()
         local overloads = terra.newlist()
         for i,e in ipairs(operands) do
             if e.type:isstruct() then
+                local overloadmethod = (#operands == 1 and unaryoverloadmethod) or genericoverloadmethod
                 local overload = e.type.metamethods[overloadmethod] --TODO: be more intelligent here about merging overloaded functions so that all possibilities are considered
                 if overload then
                     overloads:insert(terra.createterraexpression(diag, ee, overload))
@@ -3379,20 +3390,7 @@ terra.__wrappedluafunctions = {}
 -- END TYPECHECKER
 
 -- INCLUDEC
-terra.includepath = os.getenv("INCLUDE_PATH") or "."
-function terra.includecstring(code,...)
-    local args = terralib.newlist {"-O3","-Wno-deprecated",...}
-    for p in terra.includepath:gmatch("([^;]+);?") do
-        args:insert("-I")
-        args:insert(p)
-    end
-    return terra.registercfile(code,args)
-end
-function terra.includec(fname,...)
-    return terra.includecstring("#include \""..fname.."\"\n",...)
-end
-
-function terra.includetableindex(tbl,name)    --this is called when a table returned from terra.includec doesn't contain an entry
+local function includetableindex(tbl,name)    --this is called when a table returned from terra.includec doesn't contain an entry
     local v = getmetatable(tbl).errors[name]  --it is used to report why a function or type couldn't be included
     if v then
         error("includec: error importing symbol '"..name.."': "..v, 2)
@@ -3401,6 +3399,30 @@ function terra.includetableindex(tbl,name)    --this is called when a table retu
     end
     return nil
 end
+
+terra.includepath = os.getenv("INCLUDE_PATH") or "."
+function terra.includecstring(code,...)
+    local args = terralib.newlist {"-O3","-Wno-deprecated",...}
+    for p in terra.includepath:gmatch("([^;]+);?") do
+        args:insert("-I")
+        args:insert(p)
+    end
+    local result = terra.registercfile(code,args)
+    local general,tagged,errors = result.general,result.tagged,result.errors
+    local mt = { __index = includetableindex, errors = result.errors }
+    for k,v in pairs(tagged) do
+        if not general[k] then
+            general[k] = v
+        end
+    end
+    setmetatable(general,mt)
+    setmetatable(tagged,mt)
+    return general,tagged
+end
+function terra.includec(fname,...)
+    return terra.includecstring("#include \""..fname.."\"\n",...)
+end
+
 
 -- GLOBAL MACROS
 _G["sizeof"] = terra.internalmacro(function(diag,tree,typ)
@@ -3620,7 +3642,7 @@ function terra.funcdefinition:printpretty()
     end
 
     local prectable = makeprectable(
-     "+",7,"-",7,"*",7,"/",8,"%",8,
+     "+",7,"-",7,"*",8,"/",8,"%",8,
      "^",11,"..",6,"<<",4,">>",4,
      "==",3,"<",3,"<=",3,
      "~=",3,">",3,">=",3,
