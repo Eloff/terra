@@ -10,11 +10,6 @@
 //#include "lobject.h"
 #include "lzio.h"
 #include "lutil.h"
-#ifdef _WIN32
-#include "ext/setjmp.h"
-#else
-#include <setjmp.h>
-#endif
 #include <vector>
 
 #define FIRST_RESERVED  257
@@ -28,14 +23,14 @@ enum RESERVED {
   TK_AND = FIRST_RESERVED, TK_BREAK,
   TK_DO, TK_ELSE, TK_ELSEIF, TK_END, TK_FALSE, TK_FOR, TK_FUNCTION,
   TK_GOTO, TK_IF, TK_IN, TK_LOCAL, TK_NIL, TK_NOT, TK_OR, TK_REPEAT,
-  TK_RETURN, TK_THEN, TK_TRUE, TK_UNTIL, TK_WHILE, TK_TERRA, TK_VAR, TK_STRUCT, TK_UNION, TK_QUOTE, /* WARNING: if you add a new last terminal, make sure to update NUM_RESERVED below to be the last terminal */
+  TK_RETURN, TK_THEN, TK_TRUE, TK_UNTIL, TK_WHILE, TK_TERRA, TK_VAR, TK_STRUCT, TK_UNION, TK_QUOTE, TK_IMPORT, /* WARNING: if you add a new last terminal, make sure to update NUM_RESERVED below to be the last terminal */
   /* other terminal symbols */
   TK_CONCAT, TK_DOTS, TK_EQ, TK_GE, TK_LE, TK_NE, TK_DBCOLON, TK_FUNC_PTR, TK_LSHIFT, TK_RSHIFT, TK_EOS,
   TK_NUMBER, TK_NAME, TK_STRING, TK_SPECIAL
 };
 
 /* number of reserved words */
-#define NUM_RESERVED    (cast(int, TK_QUOTE-FIRST_RESERVED+1))
+#define NUM_RESERVED    (cast(int, TK_IMPORT-FIRST_RESERVED+1))
 
 
 typedef struct {
@@ -141,7 +136,6 @@ typedef struct LexState {
       int space;
   } patchinfo; //data to fix up output stream when we insert terra information
   
-  sigjmp_buf * error_dest; /* where to jump when a parse error occurs */
   int stacktop; /* top of lua stack when we start this function */
   int languageextensionsenabled; /* 0 if extensions are off */
   int rethrow; /* set to 1 when le_luaexpr needs to re-report an error message, used to suppress the duplicate
@@ -177,6 +171,7 @@ enum TA_Globals {
     TA_LIST_METATABLE,
     TA_KINDS_TABLE,
     TA_ENTRY_POINT_TABLE,
+    TA_LANGUAGES_TABLE,
     TA_LAST_GLOBAL
 };
 //accessors for lua state assocated with the Terra lexer

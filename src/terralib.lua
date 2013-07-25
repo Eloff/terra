@@ -376,8 +376,9 @@ end
 
 function terra.diagnostics:reporterror(anchor,...)
     self._haserrors[#self._haserrors] = true
-    if not anchor then
+    if not anchor or not anchor.filename or not anchor.linenumber then
         print(debug.traceback())
+        print(terralib.tree.printraw(anchor))
         error("nil anchor")
     end
     io.write(anchor.filename..":"..anchor.linenumber..": ")
@@ -880,6 +881,7 @@ do  --constructor functions for terra functions and variables
         local starttime = terra.currenttimeinseconds() 
         fn.untypedtree = terra.specialize(fn.untypedtree,env,3)
         fn.stats.specialize = terra.currenttimeinseconds() - starttime
+
         return fn
     end
     
@@ -1207,6 +1209,8 @@ do --construct type table that holds the singleton value representing each uniqu
                 local nilname = uniquetypename("niltype")
                 ffi.cdef("typedef void * "..nilname..";")
                 cstring = nilname
+            elseif self == types.opaque then
+                cstring = "void"
             elseif self == types.error then
                 cstring = "int"
             else
@@ -1288,6 +1292,17 @@ do --construct type table that holds the singleton value representing each uniqu
             return entries
         end
     }
+    local function reportopaque(anchor)
+        local msg = "attempting to use an opaque type where the layout of the type is needed"
+        if anchor then
+            local diag = terra.getcompilecontext().diagnostics
+            if not diag:haserrors() then
+                terra.getcompilecontext().diagnostics:reporterror(anchor,msg)
+            end
+        else
+            error(msg,4)
+        end
+    end
     types.type.getlayout = memoize {
         name = "layout"; 
         defaultvalue = { entries = terra.newlist(), keytoindex = {}, invalid = true };
@@ -1311,6 +1326,8 @@ do --construct type table that holds the singleton value representing each uniqu
                         t:getlayout(anchor)
                     elseif t:isarray() then
                         ensurelayout(t.type)
+                    elseif t == types.opaque then
+                        reportopaque(tree)    
                     end
                 end
                 ensurelayout(t)
@@ -1386,6 +1403,8 @@ do --construct type table that holds the singleton value representing each uniqu
                     incomplete = incomplete or self.returnobj:complete(anchor).incomplete
                 end
                 self.incomplete = incomplete
+            elseif self == types.opaque then
+                reportopaque(anchor)
             else
                 assert(self:isstruct())
                 local layout = self:getlayout(anchor)
@@ -1459,7 +1478,9 @@ do --construct type table that holds the singleton value representing each uniqu
     
     types.error   = registertype("error",  mktyp { kind = terra.kinds.error })
     types.niltype = registertype("niltype",mktyp { kind = terra.kinds.niltype}) -- the type of the singleton nil (implicitly convertable to any pointer type)
-    
+    types.opaque = registertype("opaque", mkincomplete { kind = terra.kinds.opaque }) -- an type of unknown layout used with a pointer (&opaque) to point to data of an unknown type
+                                                                               -- equivalent to "void *"
+
     local function checkistype(typ)
         if not types.istype(typ) then 
             error("expected a type but found "..type(typ))
@@ -1627,6 +1648,7 @@ do --construct type table that holds the singleton value representing each uniqu
     _G["intptr"] = uint64
     _G["ptrdiff"] = int64
     _G["niltype"] = types.niltype
+    _G["opaque"] = types.opaque
     _G["rawstring"] = types.pointer(int8)
     terra.types = types
 end
@@ -1711,8 +1733,8 @@ function terra.specialize(origtree, luaenv, depth)
                 value = value.methods
             end
 
-            local selected = value[field]
-            if selected == nil then
+            local success,selected = terra.invokeuserfunction(e,false,function() return value[field] end)
+            if not success or selected == nil then
                 diag:reporterror(e,"no field ", field," in lua object")
                 return ee
             end
@@ -2208,7 +2230,7 @@ function terra.funcdefinition:typecheck()
                 (typ:isvector() and exp.type:isvector() and typ.N == exp.type.N)) and
                not typ:islogicalorvector() and not exp.type:islogicalorvector() then
                 return cast_exp, true
-            elseif typ:ispointer() and exp.type:ispointer() and typ.type == uint8 then --implicit cast from any pointer to &uint8
+            elseif typ:ispointer() and exp.type:ispointer() and typ.type == terra.types.opaque then --implicit cast from any pointer to &opaque
                 return cast_exp, true
             elseif typ:ispointer() and exp.type == terra.types.niltype then --niltype can be any pointer
                 return cast_exp, true
@@ -2871,7 +2893,42 @@ function terra.funcdefinition:typecheck()
         if fnlike then
             if terra.ismacro(fnlike) then
                 entermacroscope()
-                local quotes = arguments:map(function(e) return terra.newquote(createtypedexpression(e)) end)
+                
+                local quotes = terra.newlist()
+                local function addquote(a)
+                    quotes:insert(terra.newquote(createtypedexpression(a)))
+                end
+                local function addtreelist(tl,N)
+                    if not tl then return end
+                    if tl.statements or N == 0 then
+                        addquote(truncateexpression(tl,N))
+                    else
+                        local NE = tl.expressions and #tl.expressions or 0
+                        if NE <= N then
+                            for i = 1,NE do
+                                addquote(tl.expressions[i])
+                            end
+                            addtreelist(tl.next,N - NE)
+                        else
+                            for i = 1,N do
+                                addquote(tl.expressions[i])
+                            end
+                            local exps = terra.newlist()
+                            for i = N+1,NE do
+                                exps:insert(tl.expressions[i])
+                            end
+                            addquote(createtypedtreelist(tl,nil,exps,terra.newlist(),tl.next))
+                        end
+                    end
+                end
+                for i,a in ipairs(arguments) do
+                    if i == #arguments and a:is "treelist" then
+                        addtreelist(a,#a.types)
+                    else
+                        addquote(a)
+                    end
+                end
+
                 local success, result = terra.invokeuserfunction(anchor, false, fnlike, diag, anchor, unpack(quotes))
                 if success then
                     local newexp = terra.createterraexpression(diag,anchor,result)
@@ -3430,7 +3487,6 @@ _G["truncate"] = terra.internalmacro(function(diag,tree,nexp,...)
     return terra.newtree(tree, { kind = terra.kinds.truncate, value = exp, size = N })
 end)
 _G["global"] = terra.global
-_G["constant"] = terra.constant
 
 terra.select = terra.internalmacro(function(diag,tree,guard,a,b)
     return terra.newtree(tree, { kind = terra.kinds.operator, operator = terra.kinds.select, operands = terra.newlist{guard.tree,a.tree,b.tree}})
@@ -3478,24 +3534,11 @@ function terra.printf(s,...)
     return io.write(tostring(s):format(unpack(strs)))
 end
 
-function terra.func:printpretty()
-    for i,v in ipairs(self.definitions) do
-        v:compile()
-        terra.printf("%s = ",v.name,v.type)
-        v:printpretty()
-    end
-end
-
 function terra.func:__tostring()
     return "<terra function>"
 end
 
-function terra.funcdefinition:printpretty()
-    self:compile()
-    if not self.typedtree then
-        terra.printf("<extern : %s>\n",self.type)
-        return
-    end
+local function printpretty(toptree,returntypes)
     local indent = 0
     local function enterblock()
         indent = indent + 1
@@ -3527,36 +3570,56 @@ function terra.funcdefinition:printpretty()
     end
 
     local function emitParam(p)
-        emit("%s : %s",p.name,p.type)
+        emit("%s",p.name)
+        if p.type then 
+            emit(" : %s",p.type)
+        end
     end
-    local emitStmt, emitExp,emitParamList
-
+    local emitStmt, emitExp,emitParamList,emitTreeList
+    local function emitStmtList(lst) --nested Blocks (e.g. from quotes need "do" appended)
+        for i,ss in ipairs(lst) do
+            if ss:is "block" then
+                begin("do\n")
+                emitStmt(ss)
+                begin("end\n")
+            else
+                emitStmt(ss)
+            end
+        end
+    end
+    local function emitAttr(a)
+        emit("{ nontemporal = %s, align = %s }",a.nontemporal or "false",a.align or "native")
+    end
     function emitStmt(s)
         if s:is "block" then
             enterblock()
             emitStmt(s.body)
             leaveblock()
         elseif s:is "treelist" then
-            local function emitStmtList(lst) --nested Blocks (e.g. from quotes need "do" appended)
-                for i,ss in ipairs(lst) do
-                    if ss:is "block" then
-                        begin("do\n")
-                        emitStmt(ss)
-                        begin("end\n")
-                    else
-                        emitStmt(ss)
-                    end
-                end
+            if s.statements then
+                emitStmtList(s.statements)
             end
-            emitStmtList(s.statements)
+            if s.trees then
+                emitStmtList(s.trees)
+            end
+            if s.expressions then
+                emitStmtList(s.expressions)
+            end
+            if s.next then
+                emitStmt(s.next)
+            end
+        elseif s:is "apply" then
+            begin("r%s = ",tostring(s):match("(0x.*)$"))
+            emitExp(s)
+            emit("\n")
         elseif s:is "return" then
             begin("return ")
             emitParamList(s.expressions)
             emit("\n")
         elseif s:is "label" then
-            begin("::%s::\n",s.labelname)
+            begin("::%s::\n",s.labelname or s.value)
         elseif s:is "goto" then
-            begin("goto %s\n",s.definition.labelname)
+            begin("goto %s\n",s.definition and s.definition.labelname or s.label)
         elseif s:is "break" then
             begin("break\n")
         elseif s:is "while" then
@@ -3583,7 +3646,9 @@ function terra.funcdefinition:printpretty()
             end
         elseif s:is "repeat" then
             begin("repeat\n")
+            enterblock()
             emitStmt(s.body)
+            leaveblock()
             begin("until ")
             emitExp(s.condition)
             emit("\n")
@@ -3597,10 +3662,18 @@ function terra.funcdefinition:printpretty()
             emit("\n")
         elseif s:is "assignment" then
             begin("")
-            emitList(s.lhs,"",", ","",emitExp)
+            emitParamList(s.lhs)
             emit(" = ")
             emitParamList(s.rhs)
             emit("\n")
+        elseif s:is "attrstore" then
+            begin("attrstore(")
+            emitExp(s.address)
+            emit(", ")
+            emitExp(s.value)
+            emit(", ")
+            emitAttr(s.attributes)
+            emit(")\n")
         else
             begin("")
             emitExp(s)
@@ -3680,14 +3753,13 @@ function terra.funcdefinition:printpretty()
                 emit("%s",e.value)
             end
         elseif e:is "luafunction" then
-            emit("<luafunction>")
-        elseif e:is "cast" then
+            emit("<lua %s>",tostring(e.callback))
+        elseif e:is "cast" or e:is "explicitcast" then
             emit("[")
-            emitType(e.to)
+            emitType(e.to or e.totype)
             emit("](")
-            emitExp(e.expression)
+            emitExp(e.expression or e.value)
             emit(")")
-
         elseif e:is "sizeof" then
             emit("sizeof(%s)",e.oftype)
         elseif e:is "apply" then
@@ -3696,7 +3768,7 @@ function terra.funcdefinition:printpretty()
             emitParamList(e.arguments)
             emit(")")
         elseif e:is "extractreturn" then
-            emit("<extract%d>",e.index)
+            emit("<exp %d from r%s>",e.index,tostring(e.fncall):match("(0x.*)$"))
         elseif e:is "select" then
             doparens(e,e.value)
             emit(".")
@@ -3711,9 +3783,19 @@ function terra.funcdefinition:printpretty()
             emit(")")
         elseif e:is "constructor" then
             emit("{")
-            local anon = 0
-            local keys = e.type:getlayout().entries:map(function(e) return e.key end)
-            emitParamList(e.expressions,keys)
+            if e.type then
+                local keys = e.type:getlayout().entries:map(function(e) return e.key end)
+                emitList(keys,"",", "," = ",emit)
+                emitParamList(e.expressions,keys)
+            else
+                local function emitRec(r)
+                    if r.key then
+                        emit("%s = ",r.key)
+                    end
+                    emitExp(r.value)
+                end
+                emitList(e.records,"",", ","",emitRec)
+            end
             emit("}")
         elseif e:is "constant" then
             if e.type:isprimitive() then
@@ -3721,40 +3803,144 @@ function terra.funcdefinition:printpretty()
             else
                 emit("<constant:",e.type,">")
             end
-        elseif e:is "typedexpressionlist" then
-            emitParamList(e)
+        elseif e:is "treelist" then
+            emitTreeList(e)
+        elseif e:is "attrload" then
+            emit("attrload(")
+            emitExp(e.address)
+            emit(", ")
+            emitAttr(e.attributes)
+            emit(")")
+        elseif e:is "intrinsic" then
+            emit("intrinsic<%s>(",e.name)
+            emitParamList(e.arguments)
+            emit(")")
+        elseif e:is "luaobject" then
+            if terra.types.istype(e.value) then
+                emit("[%s]",e.value)
+            elseif terra.ismacro(e.value) then
+                emit("<macro>")
+            elseif terra.isfunction(e.value) then
+                emit("%s",e.value.name or e.value:getdefinitions()[1].name or "<anonfunction>")
+            else
+                emit("<lua value: %s>",tostring(e.value))
+            end
+        elseif e:is "method" then
+             doparens(e,e.value)
+             emit(":%s",e.name)
+             emit("(")
+             emitParamList(e.arguments)
+             emit(")")
+        elseif e:is "truncate" then
+            if e.size and e.size ~= 1 then
+                emit("truncate(%d,",e.size)
+                emitExp(e.value)
+                emit(")")
+            else
+                emit("(")
+                emitExp(e.value)
+                emit(")")
+            end
+        elseif e:is "typedexpression" then
+            emitExp(e.expression)
         else
             emit("<??"..terra.kinds[e.kind].."??>")
         end
     end
-
-    function emitParamList(pl,keys)
-        local function emitE(e,i)
-            if keys and keys[i] then
-                emit(keys[i])
-                emit(" = ")
-            end
-            emitExp(e)
+    function emitParamList(pl)
+        if terra.islist(pl) then
+            --untyped case:
+            emitList(pl,"",", ","",emitExp)
+        else
+            --typed case:
+            emitTreeList(pl)
         end
-        emitList(pl.expressions,"",", ","",emitE)
-        if pl.fncall then
-            if #pl.expressions > 0 then
-                emit(" #")
-                emitExp(pl.fncall)
-                emit("#")
-            else
-                emitExp(pl.fncall)
+    end
+    function emitTreeList(pl)
+        local function issimplefunctioncall(pl)
+            if not pl.statements or 
+               #pl.statements ~= 1 or 
+               not pl.statements[1]:is "apply" or
+               not pl.expressions then
+               return false
             end
+            for i,exp in ipairs(pl.expressions) do
+                if not exp:is "extractreturn" then
+                    return false
+                end
+            end
+            return true
+        end
+        if pl.statements then
+            if issimplefunctioncall(pl) then
+                emitExp(pl.statements[1])
+                return
+            end
+            emit("let\n")
+            enterblock()
+            emitStmtList(pl.statements)
+            leaveblock()
+            begin("in\n")
+            enterblock()
+            begin("")
+        end
+        local exps = pl.expressions or pl.trees
+        if exps then
+            emitList(exps,"",", ","",emitExp)
+        end
+        if pl.next then
+            if exps and #exps > 0 then
+                emit(", ")
+            end
+            emitParamList(pl.next)
+        end
+        if pl.statements then
+            leaveblock()
+            emit("\n")
+            begin("end")
         end
     end
 
-    emit("terra")
-    emitList(self.typedtree.parameters,"(",",",") : ",emitParam)
-    emitList(self.type.returns,"{",", ","}",emitType)
-    emit("\n")
-    emitStmt(self.typedtree.body)
-    emit("end\n")
+    if toptree:is "function" then
+        emit("terra")
+        emitList(toptree.parameters,"(",",",") ",emitParam)
+        if returntypes then
+            emitList(returntypes,": {",", ","}",emitType)
+        end
+        emit("\n")
+        emitStmt(toptree.body)
+        emit("end\n")
+    else
+        emitExp(toptree)
+        emit("\n")
+    end
 end
+
+function terra.func:printpretty(printcompiled)
+    printcompiled = (printcompiled == nil) or printcompiled
+    for i,v in ipairs(self.definitions) do
+        terra.printf("%s = ",v.name)
+        v:printpretty(printcompiled)
+    end
+end
+
+function terra.funcdefinition:printpretty(printcompiled)
+    printcompiled = (printcompiled == nil) or printcompiled
+    if not self.untypedtree then
+        terra.printf("<extern : %s>\n",self.type)
+        return
+    end
+    if printcompiled then
+        self:compile()
+        return printpretty(self.typedtree,self.type.returns)
+    else
+        return printpretty(self.untypedtree,self.return_types)
+    end
+end
+function terra.quote:printpretty()
+    printpretty(self.tree)
+end
+
 
 -- END DEBUG
 
@@ -3901,6 +4087,7 @@ function terra.constant(a0,a1)
         return terra.constant(typ,init)
     end
 end
+_G["constant"] = terra.constant
 
 function terra.typeof(obj)
     if type(obj) ~= "cdata" then
@@ -3914,14 +4101,12 @@ function terra.linklibrary(filename)
 end
 
 terra.languageextension = {
-    languages = terra.newlist();
-    entrypoints = {}; --table mapping entry pointing tokens to the language that handles them
     tokentype = {}; --metatable for tokentype objects
     tokenkindtotoken = {}; --map from token's kind id (terra.kind.name), to the singleton table (terra.languageextension.name) 
 }
 
-function terra.loadlanguage(lang)
-    local E = terra.languageextension
+function terra.importlanguage(languages,entrypoints,langstring)
+    local lang = terra.require(langstring)
     if not lang or type(lang) ~= "table" then error("expected a table to define language") end
     lang.name = lang.name or "anonymous"
     local function haslist(field,typ)
@@ -3938,20 +4123,29 @@ function terra.loadlanguage(lang)
     haslist("entrypoints","string")
     
     for i,e in ipairs(lang.entrypoints) do
-        if E.entrypoints[e] then
-            error(("language %s uses entrypoint %s already defined by language %s"):format(lang.name,e,E.entrypoints[e].name))
+        if entrypoints[e] then
+            error(("language '%s' uses entrypoint '%s' already defined by language '%s'"):format(lang.name,e,entrypoints[e].name),-1)
         end
-        E.entrypoints[e] = lang
+        entrypoints[e] = lang
     end
-    lang.keywordtable = {} --keyword => true
-    for i,k in ipairs(lang.keywords) do
-        lang.keywordtable[k] = true
-    end
-    for i,k in ipairs(lang.entrypoints) do
-        lang.keywordtable[k] = true
-    end
-
-    E.languages:insert(lang)
+    if not lang.keywordtable then
+	    lang.keywordtable = {} --keyword => true
+	    for i,k in ipairs(lang.keywords) do
+	        lang.keywordtable[k] = true
+	    end
+	    for i,k in ipairs(lang.entrypoints) do
+	        lang.keywordtable[k] = true
+	    end
+	end
+	table.insert(languages,lang)
+end
+function terra.unimportlanguages(languages,N,entrypoints)
+    for i = 1,N do
+		local lang = table.remove(languages)
+		for i,e in ipairs(lang.entrypoints) do
+			entrypoints[e] = nil
+		end
+	end
 end
 
 function terra.languageextension.tokentype:__tostring()
@@ -4123,7 +4317,7 @@ function terra.runlanguage(lang,cur,lookahead,next,luaexpr,source,isstatement,is
     return constructor,names,lex._references
 end
 
-function terra.defaultmetamethod(method)
+_G["operator"] = terra.internalmacro(function(diag,anchor,op,...)
         local tbl = {
             __sub = "-";
             __add = "+";
@@ -4144,20 +4338,14 @@ function terra.defaultmetamethod(method)
             __rshift = ">>";
             __select = "select";
         }
-    return tbl[method] and terra.defaultoperator(tbl[method])
-end
-
-function terra.defaultoperator(op)
-    return function(...)
-        --TODO: really should call createterraexpression rather than assuming these are quotes
-        local exps = terra.newlist({...}):map(function(x) 
-            assert(terralib.isquote(x))
-            return x.tree 
-        end)
-        local tree = terra.newtree(terralib.newanchor(2), { kind = terra.kinds.operator, operator = terra.kinds[op], operands = exps })
-        return terra.newquote(tree)
+    local opv = op:asvalue()
+    opv = tbl[opv] or opv --operator can be __add or +
+    local operands= terralib.newlist()
+    for i = 1,select("#",...) do
+        operands:insert(select(i,...).tree)
     end
-end
+    return terralib.newtree(anchor, { kind = terra.kinds.operator, operator = terra.kinds[opv], operands = operands })
+end)
 
 _G["terralib"] = terra --terra code can't use "terra" because it is a keyword
 --io.write("done\n")

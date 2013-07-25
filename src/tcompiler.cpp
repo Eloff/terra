@@ -222,7 +222,7 @@ int terra_compilerinit(struct terra_State * T) {
     
     
     T->C->tm = TM;
-    T->C->mi = createManualFunctionInliningPass(T->C->td);
+    T->C->mi = createManualFunctionInliningPass(T->C->tm);
     T->C->mi->doInitialization();
     T->C->jiteventlistener = new DisassembleFunctionListener(T);
     T->C->ee->RegisterJITEventListener(T->C->jiteventlistener);
@@ -451,6 +451,9 @@ struct CCallingConv {
                 case T_niltype: {
                     t->type = Type::getInt8PtrTy(*C->ctx);
                 } break;
+                case T_opaque: {
+                    t->type = Type::getInt8Ty(*C->ctx);
+                } break;
                 default: {
                     printf("kind = %d, %s\n",typ->kind("kind"),tkindtostr(typ->kind("kind")));
                     terra_reporterror(T,"type not understood or not primitive\n");
@@ -606,10 +609,10 @@ struct CCallingConv {
         *usedint += nint;
         
         std::vector<Type*> elements;
-        elements.push_back(TypeForClass(sizes[0], classes[0]));
-        if(sizes[1] > 0) {
-            elements.push_back(TypeForClass(sizes[1],classes[1]));
-        }
+        for(int i = 0; i < 2; i++)
+            if(sizes[i] > 0)
+                elements.push_back(TypeForClass(sizes[i], classes[i]));
+        
         return Argument(C_AGGREGATE_REG,t->type,elements.size(),
                         StructType::get(*C->ctx,elements));
     }
@@ -654,23 +657,30 @@ struct CCallingConv {
         return info;
     }
     
-    Attributes SRetAttr() {
+    template<typename FnOrCall>
+    void addSRetAttr(FnOrCall * r, int idx) {
         #ifdef LLVM_3_2
             AttrBuilder builder;
             builder.addAttribute(Attributes::StructRet);
             builder.addAttribute(Attributes::NoAlias);
-            return Attributes::get(*C->ctx,builder);
+            r->addAttribute(idx,Attributes::get(*C->ctx,builder));
+        #elif LLVM_3_1
+            r->addAttribute(idx,Attributes(Attribute::StructRet | Attribute::NoAlias));
         #else
-            return Attributes(Attribute::StructRet | Attribute::NoAlias);
+            r->addAttribute(idx,Attribute::StructRet);
+            r->addAttribute(idx,Attribute::NoAlias);
         #endif
     }
-    Attributes ByValAttr() {
+    template<typename FnOrCall>
+    void addByValAttr(FnOrCall * r, int idx) {
         #ifdef LLVM_3_2
             AttrBuilder builder;
             builder.addAttribute(Attributes::ByVal);
-            return Attributes::get(*C->ctx,builder);
+            r->addAttribute(idx,Attributes::get(*C->ctx,builder));
+        #elif LLVM_3_1
+            r->addAttribute(idx,Attributes(Attribute::ByVal));
         #else
-            return Attributes(Attribute::ByVal);
+            r->addAttribute(idx,Attribute::ByVal);
         #endif
     }
     
@@ -678,14 +688,14 @@ struct CCallingConv {
     void AttributeFnOrCall(FnOrCall * r, Classification * info) {
         int argidx = 1;
         if(info->returntype.kind == C_AGGREGATE_MEM) {
-            r->addAttribute(argidx,SRetAttr());
+            addSRetAttr(r, argidx);
             argidx++;
         }
         for(int i = 0; i < info->paramtypes.size(); i++) {
             Argument * v = &info->paramtypes[i];
             if(v->kind == C_AGGREGATE_MEM) {
                 #ifndef _WIN32
-                r->addAttribute(argidx,ByValAttr());
+                addByValAttr(r, argidx);
                 #endif
             }
             argidx += v->nargs;
@@ -696,6 +706,7 @@ struct CCallingConv {
         TType * llvmtyp = GetType(ftype);
         Function * fn = Function::Create(cast<FunctionType>(llvmtyp->type), Function::ExternalLinkage,name, C->m);
         Classification * info = ClassifyFunction(ftype);
+        
         AttributeFnOrCall(fn,info);
         return fn;
     }
@@ -747,7 +758,7 @@ struct CCallingConv {
         assert(results->size() == info->nreturns);
         ArgumentKind kind = info->returntype.kind;
         
-        if(info->nreturns == 0) {
+        if(info->nreturns == 0 || (C_AGGREGATE_REG == kind && info->returntype.nargs == 0)) {
             B->CreateRetVoid();
         } else if(C_PRIMITIVE == kind) {
             assert(results->size() == 1);
@@ -823,7 +834,8 @@ struct CCallingConv {
                 Value * casted = B->CreateBitCast(aggregate,Ptr(info.returntype.cctype));
                 if(info.returntype.nargs == 1)
                     casted = B->CreateConstGEP2_32(casted, 0, 0);
-                B->CreateStore(call,casted);
+                if(info.returntype.nargs > 0)
+                    B->CreateStore(call,casted);
             }
             
             if(info.nreturns == 1) {
@@ -852,10 +864,11 @@ struct CCallingConv {
         
         Type * rt = info->returntype.type;
         if(info->returntype.kind == C_AGGREGATE_REG) {
-            if(info->returntype.nargs == 1)
-                rt = info->returntype.cctype->getElementType(0);
-            else
-                rt = info->returntype.cctype;
+            switch(info->returntype.nargs) {
+                case 0: rt = Type::getVoidTy(*C->ctx); break;
+                case 1: rt = info->returntype.cctype->getElementType(0); break;
+                default: rt = info->returntype.cctype; break;
+            }
         } else if(info->returntype.kind == C_AGGREGATE_MEM) {
             rt = Type::getVoidTy(*C->ctx);
             arguments.push_back(Ptr(info->returntype.type));

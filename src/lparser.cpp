@@ -7,11 +7,6 @@
 
 #include <string.h>
 #include <assert.h>
-#ifdef _WIN32
-#include "ext/setjmp.h"
-#else
-#include <setjmp.h>
-#endif
 
 #define lparser_c
 #define LUA_CORE
@@ -72,6 +67,7 @@ typedef struct BlockCnt {
   struct BlockCnt *previous;  /* chain */
   StringSet defined;
   int isterra; /* does this scope describe a terra scope or a lua scope?*/
+  int languageextensionsdefined;
 } BlockCnt;
 
 struct TerraCnt {
@@ -352,6 +348,7 @@ static void enterlevel (LexState *ls) {
 static void enterblock (FuncState *fs, BlockCnt *bl, lu_byte isloop) {
   bl->previous = fs->bl;
   bl->isterra = fs->ls->in_terra;
+  bl->languageextensionsdefined = 0;
   fs->bl = bl;
   //printf("entering block %lld\n", (long long int)bl);
   //printf("previous is %lld\n", (long long int)bl->previous);
@@ -364,6 +361,14 @@ static void breaklabel (LexState *ls) {
 static void leaveblock (FuncState *fs) {
   BlockCnt *bl = fs->bl;
   LexState *ls = fs->ls;
+  if(bl->languageextensionsdefined > 0) {
+    luaX_globalgetfield(ls, TA_TERRA_OBJECT, "unimportlanguages");
+    luaX_globalpush(ls, TA_LANGUAGES_TABLE);
+    lua_pushnumber(ls->L, bl->languageextensionsdefined);
+    luaX_globalpush(ls, TA_ENTRY_POINT_TABLE);
+    lua_call(ls->L, 3, 0);
+    ls->languageextensionsenabled -= bl->languageextensionsdefined;
+  }
   fs->bl = bl->previous;
   //printf("leaving block %lld\n", (long long int)bl);
   //printf("now is %lld\n", (long long int)fs->bl);
@@ -539,12 +544,19 @@ static void recfield (LexState *ls, struct ConsControl *cc) {
     if(!ls->in_terra) {
       yindex(ls, &key);
     } else {
-      checksymbol(ls,NULL);
-      if(ls->t.token != '=') {
-        /* oops! this wasn't a recfield, but a listfield with an antiquote 
+      RETURNS_1(expr(ls,&val));
+      if(ls->t.token == '=') {
+        lua_getfield(ls->L,-1, "kind");
+        int kind = lua_tointeger(ls->L, -1);
+        lua_pop(ls->L,1); /* the kind */
+        if(kind != T_luaexpression)
+            luaX_syntaxerror(ls, "unexpected symbol");
+        int sym = new_table_before(ls, T_symbol);
+        add_field(ls, sym, "expression");
+        
+      } else {
+        /* oops! this wasn't a recfield, but a listfield with an antiquote
            this is a somewhat unfortunate corner case of terra's parsing rules: we need to fix the AST now */
-        lua_getfield(ls->L,-1,"expression");
-        lua_remove(ls->L,-2); //remove the T_symbol, now we have { kind = recfield }, luaexpression
         add_field(ls,tbl,"value");
         //replace T_recfield with T_listfield
         push_double(ls,T_listfield);
@@ -2027,6 +2039,28 @@ static void statement (LexState *ls) {
       RETURNS_1(gotostat(ls));
       break;
     }
+    case TK_IMPORT: {
+      check_no_terra(ls, "import statements");
+      Token begin = ls->t;
+      luaX_next(ls);
+      check(ls,TK_STRING);
+      luaX_globalgetfield(ls, TA_TERRA_OBJECT, "importlanguage");
+      luaX_globalpush(ls, TA_LANGUAGES_TABLE);
+      luaX_globalpush(ls, TA_ENTRY_POINT_TABLE);
+      lua_pushstring(ls->L, getstr(ls->t.seminfo.ts));
+      ls->languageextensionsenabled++;
+      ls->fs->bl->languageextensionsdefined++;
+      
+      if(lua_pcall(ls->L, 3, 0, 0)) {
+        const char * str = luaL_checkstring(ls->L,-1);
+        luaX_syntaxerror(ls, str);
+      }
+      luaX_next(ls); /* skip string */
+      luaX_patchbegin(ls, &begin);
+      OutputBuffer_printf(&ls->output_buffer, "do end");
+      luaX_patchend(ls, &begin);
+      break;
+    }
       /*otherwise, fallthrough to the normal error message.*/
     default: {  /* stat -> func | assignment */
       RETURNS_1(exprstat(ls));
@@ -2036,9 +2070,19 @@ static void statement (LexState *ls) {
   leavelevel(ls);
 }
 
+static void le_handleerror(LexState * ls) {
+  /* there was an error, it is on the top of the stack
+       we need to call lua's error handler to rethrow the error. */
+  ls->rethrow = 1; /* prevent languageextension from adding the context again */
+  lua_error(ls->L); /* does not return */
+}
 static int le_next(lua_State * L) {
     LexState * ls = (LexState*) lua_topointer(L,lua_upvalueindex(1));
-    luaX_next(ls);
+    try {
+      luaX_next(ls);
+    } catch(...) {
+      le_handleerror(ls);
+    }
     return 0;
 }
 
@@ -2091,30 +2135,23 @@ static int le_cur(lua_State * L) {
 }
 static int le_lookahead(lua_State * L) {
     LexState * ls = (LexState*) lua_topointer(L,lua_upvalueindex(1));
-    luaX_lookahead(ls);
-    converttokentolua(ls, &ls->lookahead);
+    try {
+      luaX_lookahead(ls);
+      converttokentolua(ls, &ls->lookahead);
+    } catch(...) {
+      le_handleerror(ls);
+    }
     return 1;
 }
 
 static int le_luaexpr(lua_State * L) {
   LexState * ls = (LexState*) lua_topointer(L,lua_upvalueindex(1));
   
-  sigjmp_buf * old_dest = ls->error_dest;
-  sigjmp_buf error_dest;
-  int err = sigsetjmp(error_dest, 0);
-  if(!err) {
-    ls->error_dest = &error_dest;
+  try {
     luaexpr(ls);
-  } else {
-    /* there was an error, it is on the top of the stack
-       we need to call lua's error handler to rethrow the error. */
-    ls->error_dest = old_dest;
-    ls->rethrow = 1; /* prevent languageextension from adding the context again */
-    lua_error(ls->L); /* does not return */
+  } catch(...) {
+    le_handleerror(ls);
   }
-  //reset to previous error handler
-  ls->error_dest = old_dest;
-  //TODO: catch and re-throw the error
   lua_getfield(ls->L,-1,"expression");
   lua_remove(ls->L,-2); /* remove original object, we just want to return the function */
   return 1;
@@ -2291,21 +2328,17 @@ int luaY_parser (terra_State *T, ZIO *z,
   lua_getfield(L,to,"kinds");
   luaX_globalset(&lexstate, TA_KINDS_TABLE);
   
-  lua_getfield(L,to,"languageextension");
-  lua_getfield(L,-1,"languages");
-  lexstate.languageextensionsenabled = lua_objlen(L,-1) > 0;
-  lua_pop(L,1);
-  lua_getfield(L,-1,"entrypoints");
-  lua_remove(L,-2); /*remove language extension table*/
+  
+  lua_newtable(L);
   luaX_globalset(&lexstate, TA_ENTRY_POINT_TABLE);
+  lua_newtable(L);
+  luaX_globalset(&lexstate, TA_LANGUAGES_TABLE);
+  lexstate.languageextensionsenabled = 0;
   
   lua_pop(L,1); /* remove gs and terra object from stack */
   
   assert(lua_gettop(L) == lexstate.stacktop);
-  sigjmp_buf error_dest;
-  int err = sigsetjmp(error_dest,0);
-  if(!err) {
-    lexstate.error_dest = &error_dest;
+  try {
     luaX_setinput(T, &lexstate, z, tname, firstchar);
     open_mainfunc(&lexstate, &funcstate, &bl);
     luaX_next(&lexstate);  /* read first token */
@@ -2313,7 +2346,7 @@ int luaY_parser (terra_State *T, ZIO *z,
     check(&lexstate, TK_EOS);
     close_func(&lexstate);
     assert(!funcstate.prev && !lexstate.fs);
-  } else {
+  } catch(int err) {
     cleanup(&lexstate);
     assert(lua_gettop(L) > lexstate.stacktop);
     if(lua_gettop(L) > lexstate.stacktop + 1) {
@@ -2321,7 +2354,6 @@ int luaY_parser (terra_State *T, ZIO *z,
         lua_settop(L, lexstate.stacktop + 1); //reset the stack to just 1 above where it orignally (holding the error message)
     }
     assert(lua_gettop(L) == lexstate.stacktop + 1);
-    
     return err;
   }
 
@@ -2336,7 +2368,7 @@ int luaY_parser (terra_State *T, ZIO *z,
   while(lexstate.output_buffer.data[lexstate.output_buffer.N-1] == '\0' && lexstate.output_buffer.N > 0) {
     lexstate.output_buffer.N--;
   }
-  err = luaL_loadbuffer(L, lexstate.output_buffer.data, lexstate.output_buffer.N, name);  
+  int err = luaL_loadbuffer(L, lexstate.output_buffer.data, lexstate.output_buffer.N, name);  
   cleanup(&lexstate);
   return err;
 }

@@ -18,6 +18,7 @@ extern "C" {
 #include <iostream>
 
 #include "llvmheaders.h"
+#include "clang/AST/Attr.h"
 #include "tcompilerstate.h"
 #include "clangpaths.h"
 
@@ -177,7 +178,7 @@ public:
           case Type::Builtin:
             switch (cast<BuiltinType>(Ty)->getKind()) {
             case BuiltinType::Void:
-              InitType("uint8",tt);
+              InitType("opaque",tt);
                 return true;
             case BuiltinType::Bool:
                 assert(!"bool?");
@@ -384,11 +385,16 @@ public:
          // Function name
         DeclarationName DeclName = f->getNameInfo().getName();
         std::string FuncName = DeclName.getAsString();
-        
         const FunctionType * fntyp = f->getType()->getAs<FunctionType>();
         
         if(!fntyp)
             return true;
+        
+        if(f->getStorageClass() == clang::SC_Static) {
+            ImportError("cannot import static functions.");
+            SetErrorReport(FuncName.c_str());
+            return true;
+        }
         
         Obj typ;
         if(!GetFuncType(fntyp,&typ)) {
@@ -463,14 +469,24 @@ private:
 static void initializeclang(terra_State * T, llvm::MemoryBuffer * membuffer, const char ** argbegin, const char ** argend, CompilerInstance * TheCompInst) {
     // CompilerInstance will hold the instance of the Clang compiler for us,
     // managing the various objects needed to run the compiler.
+    #if defined LLVM_3_1 || defined LLVM_3_2
     TheCompInst->createDiagnostics(0, 0);
+    #else
+    TheCompInst->createDiagnostics();
+    #endif
     
     CompilerInvocation::CreateFromArgs(TheCompInst->getInvocation(), argbegin, argend, TheCompInst->getDiagnostics());
     //need to recreate the diagnostics engine so that it actually listens to warning flags like -Wno-deprecated
     //this cannot go before CreateFromArgs
+    #if defined LLVM_3_1 || defined LLVM_3_2
     TheCompInst->createDiagnostics(argbegin - argend, argbegin);
+    TargetOptions & to = TheCompInst->getTargetOpts();
+    #else
+    TheCompInst->createDiagnostics();
+    TargetOptions * to = &TheCompInst->getTargetOpts();
+    #endif
     
-    TargetInfo *TI = TargetInfo::CreateTargetInfo(TheCompInst->getDiagnostics(), TheCompInst->getTargetOpts());
+    TargetInfo *TI = TargetInfo::CreateTargetInfo(TheCompInst->getDiagnostics(), to);
     TheCompInst->setTarget(TI);
     
     TheCompInst->createFileManager();
@@ -531,9 +547,13 @@ static int dofile(terra_State * T, const char * code, const char ** argbegin, co
     CompilerInstance TheCompInst;
     llvm::MemoryBuffer * membuffer = llvm::MemoryBuffer::getMemBufferCopy(buffer, "<buffer>");
     initializeclang(T, membuffer, argbegin, argend, &TheCompInst);
-                                           
+    
+    #if defined LLVM_3_1 || defined LLVM_3_2
     CodeGenerator * codegen = CreateLLVMCodeGen(TheCompInst.getDiagnostics(), "mymodule", TheCompInst.getCodeGenOpts(), *T->C->ctx );
-
+    #else
+    CodeGenerator * codegen = CreateLLVMCodeGen(TheCompInst.getDiagnostics(), "mymodule", TheCompInst.getCodeGenOpts(), TheCompInst.getTargetOpts(), *T->C->ctx );
+    #endif
+    
     ParseAST(TheCompInst.getPreprocessor(),
             codegen,
             TheCompInst.getASTContext());

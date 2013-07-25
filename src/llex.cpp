@@ -47,7 +47,7 @@ static const char *const luaX_tokens [] = {
     "and", "break", "do", "else", "elseif",
     "end", "false", "for", "function", "goto", "if",
     "in", "local", "nil", "not", "or", "repeat",
-    "return", "then", "true", "until", "while", "terra", "var","struct","union","quote",
+    "return", "then", "true", "until", "while", "terra", "var","struct","union","quote","import",
     "..", "...", "==", ">=", "<=", "~=", "::", "->", "<<", ">>", "<eof>",
     "<number>", "<name>", "<string>", "<special>"
 };
@@ -165,7 +165,7 @@ static const char *txtToken (LexState *ls, int token) {
 
 l_noret luaX_reporterror(LexState * ls, const char * err) {
     lua_pushstring(ls->L, err);
-    siglongjmp(*ls->error_dest, LUA_ERRSYNTAX);
+    throw LUA_ERRSYNTAX;
     abort(); //quiet warnings about noret
 }
 
